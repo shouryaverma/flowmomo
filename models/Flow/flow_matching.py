@@ -19,6 +19,21 @@ class FlowMatching(nn.Module):
         self.temp_schedule = temp_schedule
         self.atom_vocab = AtomVocab()
         
+        # DoPri5 coefficients (Dormand-Prince 5(4) method)
+        self.dopri5_a = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 0],
+            [1/5, 0, 0, 0, 0, 0, 0],
+            [3/40, 9/40, 0, 0, 0, 0, 0],
+            [44/45, -56/15, 32/9, 0, 0, 0, 0],
+            [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0, 0],
+            [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0, 0],
+            [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0]
+        ])
+        
+        self.dopri5_b = torch.tensor([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+        self.dopri5_b_hat = torch.tensor([5179/57600, 0, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40])
+        self.dopri5_c = torch.tensor([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+        
     def add_noise(self, X, S, A, generate_mask, block_ids, batch_ids, t=None):
         """Linear interpolation between noise and data (rectified flow)"""
         batch_size = batch_ids.max() + 1
@@ -119,12 +134,249 @@ class FlowMatching(nn.Module):
         x_t = torch.multinomial(x_t_probs + 1e-8, 1).squeeze(-1)
         
         return torch.clamp(x_t, 0, max_val - 1)
+
+    def compute_velocity(self, model, t, x_t, s_t, a_t, bonds, position_ids, 
+                        chain_ids, generate_mask, block_lengths, lengths, is_aa):
+        """Compute velocity field for DoPri5 integration"""
+        batch_ids = length_to_batch_id(lengths)
+        block_ids = length_to_batch_id(block_lengths)
         
+        # Forward pass through model
+        H = model.embedding(s_t, a_t, block_ids)
+        H = model.embed2hidden(H)
+        
+        # Add time conditioning
+        atom_batch_ids = batch_ids[block_ids]
+        max_batch_idx = len(t) - 1
+        atom_batch_ids = torch.clamp(atom_batch_ids, 0, max_batch_idx)
+        t_per_atom = t[atom_batch_ids]
+        t_embed = model.time_embedding(t_per_atom)
+        H = H + model.time_proj(t_embed)
+        
+        # Get edges for current state
+        edges, edge_type = model.get_edges(
+            batch_ids, chain_ids, x_t, block_ids, generate_mask, 
+            position_ids, is_aa, block_lengths
+        )
+        edge_attr = model.edge_embedding(edge_type)
+        
+        # Encode then decode
+        H_encoded, X_encoded = model.encoder(H, x_t, block_ids, batch_ids, edges, edge_attr)
+        H_decoded, X_decoded = model.decoder(H_encoded, X_encoded, block_ids, batch_ids, edges, edge_attr)
+        
+        # Get velocity predictions
+        v_x = model.coord_velocity_head(H_decoded)
+        v_a = model.atom_velocity_head(H_decoded)
+        v_s = model.block_velocity_head(H_decoded)
+        v_s = scatter_mean(v_s, block_ids, dim=0)
+        
+        return v_x, v_a, v_s, edges
+
+    def dopri5_step(self, model, t, dt, x_t, s_t, a_t, bonds, position_ids, 
+                   chain_ids, generate_mask, block_lengths, lengths, is_aa, 
+                   apply_constraints=True):
+        """Single DoPri5 step with adaptive error control"""
+        device = x_t.device
+        batch_size = len(lengths)
+        
+        # Move coefficients to device
+        a_coeffs = self.dopri5_a.to(device)
+        b_coeffs = self.dopri5_b.to(device)
+        b_hat_coeffs = self.dopri5_b_hat.to(device)
+        c_coeffs = self.dopri5_c.to(device)
+        
+        # Store intermediate k values for coordinates
+        k_x = torch.zeros(7, *x_t.shape, device=device)
+        k_s = torch.zeros(7, *s_t.shape, device=device)
+        k_a = torch.zeros(7, *a_t.shape, device=device)
+        
+        # Current time for batch
+        t_current = torch.full((batch_size,), t, device=device)
+        
+        # Six stages of DoPri5
+        for i in range(6):
+            # Compute intermediate state
+            x_temp = x_t.clone()
+            s_temp = s_t.clone()
+            a_temp = a_t.clone()
+            
+            for j in range(i):
+                x_temp += dt * a_coeffs[i, j] * k_x[j]
+                # For discrete variables, use smaller updates
+                s_temp = self.update_discrete_rk(s_temp, k_s[j], dt * a_coeffs[i, j], generate_mask)
+                a_temp = self.update_discrete_rk(a_temp, k_a[j], dt * a_coeffs[i, j], generate_mask[length_to_batch_id(block_lengths)])
+            
+            # Apply constraints to intermediate state
+            if apply_constraints:
+                x_temp, a_temp = self.apply_chemical_constraints(
+                    x_temp, a_temp, s_temp, generate_mask, 
+                    length_to_batch_id(block_lengths), length_to_batch_id(lengths),
+                    chain_ids, torch.empty(2, 0, device=device)  # Dummy edges for now
+                )
+            
+            # Compute velocity at intermediate point
+            t_temp = t_current + c_coeffs[i] * dt
+            v_x, v_a, v_s, edges = self.compute_velocity(
+                model, t_temp, x_temp, s_temp, a_temp, bonds, position_ids,
+                chain_ids, generate_mask, block_lengths, lengths, is_aa
+            )
+            
+            # Store k values
+            k_x[i] = v_x
+            k_s[i] = v_s
+            k_a[i] = v_a
+        
+        # Compute 5th order solution
+        x_new = x_t.clone()
+        s_new = s_t.clone()
+        a_new = a_t.clone()
+        
+        for i in range(7):
+            x_new += dt * b_coeffs[i] * k_x[i]
+            s_new = self.update_discrete_rk(s_new, k_s[i], dt * b_coeffs[i], generate_mask)
+            a_new = self.update_discrete_rk(a_new, k_a[i], dt * b_coeffs[i], generate_mask[length_to_batch_id(block_lengths)])
+        
+        # Compute 4th order solution for error estimation
+        x_hat = x_t.clone()
+        s_hat = s_t.clone()
+        a_hat = a_t.clone()
+        
+        for i in range(7):
+            x_hat += dt * b_hat_coeffs[i] * k_x[i]
+            s_hat = self.update_discrete_rk(s_hat, k_s[i], dt * b_hat_coeffs[i], generate_mask)
+            a_hat = self.update_discrete_rk(a_hat, k_a[i], dt * b_hat_coeffs[i], generate_mask[length_to_batch_id(block_lengths)])
+        
+        # Error estimation (only for coordinates - discrete variables are handled differently)
+        gen_mask_atoms = generate_mask[length_to_batch_id(block_lengths)]
+        if gen_mask_atoms.any():
+            error_x = torch.norm(x_new - x_hat, dim=-1)[gen_mask_atoms]
+            max_error = error_x.max().item() if len(error_x) > 0 else 0.0
+        else:
+            max_error = 0.0
+        
+        return x_new, s_new, a_new, max_error
+
+    def update_discrete_rk(self, x_current, k_logits, dt_coeff, mask, temperature=0.1):
+        """Update discrete variables in Runge-Kutta style"""
+        if not mask.any() or torch.abs(dt_coeff) < 1e-12:
+            return x_current
+        
+        # Convert logits to probabilities
+        probs = F.softmax(k_logits / temperature, dim=-1)
+        
+        # Current state as one-hot
+        if len(x_current.shape) == 1:  # If not one-hot yet
+            x_current_oh = F.one_hot(x_current, probs.shape[-1]).float()
+        else:
+            x_current_oh = x_current
+        
+        # Small update toward velocity direction
+        update_factor = torch.tanh(dt_coeff)  # Bound the update
+        x_new_oh = x_current_oh + update_factor * (probs - x_current_oh)
+        x_new_oh = x_new_oh / (x_new_oh.sum(-1, keepdim=True) + 1e-8)
+        
+        # Sample new discrete values
+        x_new = torch.multinomial(x_new_oh + 1e-8, 1).squeeze(-1)
+        
+        # Only update in mask regions
+        return torch.where(mask, x_new, x_current)
+
+    @torch.no_grad()
+    def sample_dopri5(self, model, X, S, A, bonds, position_ids, chain_ids, 
+                     generate_mask, block_lengths, lengths, is_aa, 
+                     rtol=1e-5, atol=1e-6, max_steps=1000, apply_constraints=True, **kwargs):
+        """DoPri5 adaptive sampling for rectified flow with chemical constraints"""
+        
+        batch_ids = length_to_batch_id(lengths)
+        block_ids = length_to_batch_id(block_lengths)
+        
+        # Initialize from chemically-informed noise in generation regions
+        x_t = self.sample_chemical_prior(X, A, generate_mask, block_ids)
+        x_t = torch.where(generate_mask[block_ids][..., None], x_t, X)
+        
+        s_t = self.sample_discrete_prior(S, generate_mask)
+        a_t = self.sample_discrete_prior(A, generate_mask[block_ids])
+        
+        # Adaptive integration parameters
+        t = 0.0
+        dt = 0.01  # Initial step size
+        dt_min = 1e-6
+        dt_max = 0.1
+        safety_factor = 0.9
+        step_count = 0
+        
+        # Target tolerances
+        atol = atol
+        rtol = rtol
+        
+        while t < 1.0 and step_count < max_steps:
+            # Ensure we don't overshoot
+            if t + dt > 1.0:
+                dt = 1.0 - t
+            
+            # Attempt a step
+            x_new, s_new, a_new, error = self.dopri5_step(
+                model, t, dt, x_t, s_t, a_t, bonds, position_ids,
+                chain_ids, generate_mask, block_lengths, lengths, is_aa,
+                apply_constraints
+            )
+            
+            # Calculate tolerance
+            scale = atol + rtol * torch.max(torch.abs(x_t), torch.abs(x_new))
+            tolerance = scale.max().item()
+            
+            # Check if step is acceptable
+            if error <= tolerance or dt <= dt_min:
+                # Accept step
+                x_t = x_new
+                s_t = s_new
+                a_t = a_new
+                t += dt
+                step_count += 1
+                
+                # Final constraint application
+                if apply_constraints:
+                    x_t, a_t = self.apply_chemical_constraints(
+                        x_t, a_t, s_t, generate_mask, block_ids, batch_ids,
+                        chain_ids, torch.empty(2, 0, device=x_t.device)
+                    )
+            
+            # Adapt step size for next iteration
+            if error > 1e-12:  # Avoid division by zero
+                error_ratio = tolerance / error
+                dt_new = dt * safety_factor * (error_ratio ** 0.2)  # 5th order method
+                dt = torch.clamp(torch.tensor(dt_new), dt_min, dt_max).item()
+            else:
+                dt = min(dt * 2.0, dt_max)  # Increase step size if error is very small
+        
+        if step_count >= max_steps:
+            print(f"Warning: DoPri5 reached maximum steps ({max_steps})")
+        
+        return self.format_output(x_t, s_t, a_t, generate_mask, block_ids, lengths)
+
     @torch.no_grad()
     def sample(self, model, X, S, A, bonds, position_ids, chain_ids, 
                generate_mask, block_lengths, lengths, is_aa, num_steps=50, 
-               apply_constraints=True, **kwargs):
-        """Euler sampling for rectified flow with chemical constraints"""
+               apply_constraints=True, use_dopri5=True, **kwargs):
+        """Choose between Euler and DoPri5 sampling"""
+        if use_dopri5:
+            return self.sample_dopri5(
+                model, X, S, A, bonds, position_ids, chain_ids,
+                generate_mask, block_lengths, lengths, is_aa,
+                apply_constraints=apply_constraints, **kwargs
+            )
+        else:
+            return self.sample_euler(
+                model, X, S, A, bonds, position_ids, chain_ids,
+                generate_mask, block_lengths, lengths, is_aa,
+                num_steps, apply_constraints, **kwargs
+            )
+    
+    @torch.no_grad()
+    def sample_euler(self, model, X, S, A, bonds, position_ids, chain_ids, 
+                    generate_mask, block_lengths, lengths, is_aa, num_steps=50, 
+                    apply_constraints=True, **kwargs):
+        """Original Euler sampling method (kept for comparison)"""
         
         batch_ids = length_to_batch_id(lengths)
         block_ids = length_to_batch_id(block_lengths)
@@ -144,30 +396,11 @@ class FlowMatching(nn.Module):
             # Get current temperature for discrete updates
             temp = self.get_temperature(i, num_steps)
             
-            # Forward pass through model
-            H = model.embedding(s_t, a_t, block_ids)
-            H = model.embed2hidden(H)
-            
-            # Add time conditioning  
-            t_embed = model.time_embedding(t[batch_ids])
-            H = H + model.time_proj(t_embed)
-            
-            # Get edges for current state
-            edges, edge_type = model.get_edges(
-                batch_ids, chain_ids, x_t, block_ids, generate_mask, 
-                position_ids, is_aa, block_lengths
+            # Compute velocities
+            v_x, v_a, v_s, edges = self.compute_velocity(
+                model, t, x_t, s_t, a_t, bonds, position_ids,
+                chain_ids, generate_mask, block_lengths, lengths, is_aa
             )
-            edge_attr = model.edge_embedding(edge_type)
-            
-            # Encode then decode
-            H_encoded, X_encoded = model.encoder(H, x_t, block_ids, batch_ids, edges, edge_attr)
-            H_decoded, X_decoded = model.decoder(H_encoded, X_encoded, block_ids, batch_ids, edges, edge_attr)
-            
-            # Get velocity predictions
-            v_x = model.coord_velocity_head(H_decoded)
-            v_a = model.atom_velocity_head(H_decoded)
-            v_s = model.block_velocity_head(H_decoded)
-            v_s = scatter_mean(v_s, block_ids, dim=0)
             
             # Update using Euler method
             x_t_new = x_t + v_x * dt

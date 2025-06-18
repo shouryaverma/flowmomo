@@ -397,12 +397,27 @@ class MolecularRectifiedFlow(nn.Module):
     def sample(
         self,
         X, S, A, bonds, position_ids, chain_ids, generate_mask, 
-        block_lengths, lengths, is_aa, num_steps=50, **kwargs
+        block_lengths, lengths, is_aa, 
+        num_steps=50,           # For Euler method
+        use_dopri5=True,        # NEW: Enable DoPri5 adaptive sampling
+        rtol=1e-5,             # NEW: Relative tolerance for DoPri5
+        atol=1e-6,             # NEW: Absolute tolerance for DoPri5
+        max_steps=1000,        # NEW: Max steps for adaptive integration
+        apply_constraints=True, # Chemical constraints during sampling
+        **kwargs
     ):
-        """Sample using rectified flow with chemical constraints"""
+        """Sample using rectified flow with optional DoPri5 adaptive integration"""
         return self.flow_matching.sample(
-            self, X, S, A, bonds, position_ids, chain_ids, generate_mask,
-            block_lengths, lengths, is_aa, num_steps, **kwargs
+            self,                # Pass model (self) to flow_matching
+            X, S, A, bonds, position_ids, chain_ids, generate_mask,
+            block_lengths, lengths, is_aa, 
+            num_steps=num_steps,
+            use_dopri5=use_dopri5,
+            rtol=rtol,
+            atol=atol,
+            max_steps=max_steps,
+            apply_constraints=apply_constraints,
+            **kwargs
         )
 
     def generate(self, *args, **kwargs):
