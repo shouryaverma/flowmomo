@@ -3,5 +3,7 @@
 from .modules.GET.get import GET
 from .IterVAE.model import CondIterAutoEncoder
 from .LDM.ldm import LDMMolDesign
-from .Flow.rectified_flow import MolecularRectifiedFlow
-from .Flow.flow_matching import FlowMatching
+# from .Flow.rectified_flow import MolecularRectifiedFlow
+# from .Flow.flow_matching import FlowMatching
+from .Rect.flow_matching import FlowMatching
+from .Rect.rectified_flow import RectifiedFlowMolDesign

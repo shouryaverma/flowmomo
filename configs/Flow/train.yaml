@@ -22,7 +22,7 @@ dataset:
             length_type: block
         # weights: [1.0, 1.0, 1.0]
       complexity: n*n
-      ubound_per_batch: 40000  # Moderate batch size for flow training
+      ubound_per_batch: 90000  # Moderate batch size for flow training
       n_use_max_in_batch: true
     # Small Molecules
     - class: DynamicBatchWrapper
@@ -32,7 +32,7 @@ dataset:
         specify_index: ./datasets/molecule/CrossDocked/processed/train_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 20000  # Smaller for molecules (more complex)
+      ubound_per_batch: 40000  # Smaller for molecules (more complex)
       n_use_max_in_batch: true
     # Antibody
     - class: DynamicBatchWrapper
@@ -42,7 +42,7 @@ dataset:
         specify_index: ./datasets/antibody/SAbDab/processed/train_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 30000
+      ubound_per_batch: 45000 # Moderate batch size for antibodies
       n_use_max_in_batch: true
   valid:
     - class: DynamicBatchWrapper
@@ -52,7 +52,7 @@ dataset:
         specify_index: ./datasets/peptide/pepbench/processed/valid_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 40000
+      ubound_per_batch: 90000 # Moderate batch size for flow validation
       n_use_max_in_batch: true
     - class: DynamicBatchWrapper
       dataset:
@@ -61,7 +61,7 @@ dataset:
         specify_index: ./datasets/molecule/CrossDocked/processed/valid_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 15000  # Smaller for validation sampling
+      ubound_per_batch: 60000  # Smaller for validation sampling
       n_use_max_in_batch: true
     - class: DynamicBatchWrapper
       dataset:
@@ -70,7 +70,7 @@ dataset:
         specify_index: ./datasets/antibody/SAbDab/processed/valid_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 30000
+      ubound_per_batch: 45000 # Smaller for validation sampling
       n_use_max_in_batch: true
 
 dataloader:

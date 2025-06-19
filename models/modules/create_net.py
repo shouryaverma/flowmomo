@@ -14,6 +14,7 @@ def create_net(
         kargs = {
             'hidden_size': hidden_size,
             'ffn_size': hidden_size,
+            'n_rbf': 16,
             'edge_size': edge_size
         }
         kargs.update(opt)
