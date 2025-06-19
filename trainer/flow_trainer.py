@@ -5,12 +5,8 @@ import numpy as np
 from torch_scatter import scatter_mean
 from utils import register as R
 from utils.gnn_utils import length_to_batch_id
-from utils.chem_utils import (
-    check_stability, diversity, similarity, mol2smi, smi2mol,
-    calculate_1dqsar_repr, AtomVocab
-)
+from utils.chem_utils import (check_stability, AtomVocab)
 from .abs_trainer import Trainer
-
 
 @R.register('FlowTrainer')
 class FlowTrainer(Trainer):
