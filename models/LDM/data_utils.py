@@ -73,6 +73,12 @@ class OverwriteTask:
         for i, index in enumerate(overwrite_indexes):
             block_S, block_X, block_A, block_ll, block_bonds = self.S[i], self.X[i], self.A[i], self.ll[i], self.intra_bonds[i]
             block_name = 'UNK' if block_S is None else VOCAB.idx_to_abrv(block_S)
+
+            # SAFEGUARD: Ensure block_name is valid for PDB format
+            if block_name is None or len(block_name) > 3 or not block_name.isalnum():
+                print(f"WARNING: Invalid block_name '{block_name}', using 'UNK'")
+                block_name = 'UNK'
+
             # construct a new block
             atoms, local2global = [], {}
             if block_bonds is None or is_standard_aa(block_name): # use canonical order

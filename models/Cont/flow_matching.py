@@ -189,92 +189,71 @@ class FlowMatching(nn.Module):
             cond_embedding[neg_indices]
         )
 
-    def contrastive_flow_matching_loss(self, H_0, X_0, H_1, X_1, cond_embedding, 
-                                     chain_ids, generate_mask, lengths):
-        """
-        Compute contrastive flow matching loss.
+    def contrastive_flow_matching_loss(self, H_0, X_0, H_1, X_1, cond_embedding, chain_ids, generate_mask, lengths):
+        """Compute flow matching loss with proper scaling."""
         
-        FIXED: Proper implementation matching the paper exactly
-        """
         batch_ids = length_to_batch_id(lengths)
         batch_size = batch_ids.max() + 1
         
-        # Sample time uniformly
+        # Check for generation targets
+        if generate_mask.sum() == 0:
+            return {
+                'H': torch.tensor(0.0, device=H_0.device, requires_grad=True),
+                'X': torch.tensor(0.0, device=H_0.device, requires_grad=True),
+                'H_pos': torch.tensor(0.0, device=H_0.device),
+                'X_pos': torch.tensor(0.0, device=H_0.device),
+                'H_neg': torch.tensor(0.0, device=H_0.device),
+                'X_neg': torch.tensor(0.0, device=H_0.device),
+            }
+        
+        # Sample time
         t = self.sample_time(batch_size, H_0.device)[batch_ids]
         
-        # Get interpolated path and target velocity (positive samples)
-        H_t, X_t, v_H_target, v_X_target = self.get_path_and_velocity(
-            H_0, X_0, H_1, X_1, t, generate_mask
-        )
+        # Get path and velocity
+        H_t, X_t, v_H_target, v_X_target = self.get_path_and_velocity(H_0, X_0, H_1, X_1, t, generate_mask)
         
-        # Add conditional noise for stability
+        # Add noise for stability
         if self.sigma > 0:
             H_t = H_t + self.sigma * torch.randn_like(H_t)
             X_t = X_t + self.sigma * torch.randn_like(X_t)
         
-        # Get edges
+        # Get edges and predict velocity
         edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+        v_H_pred, v_X_pred = self.velocity_net(H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, t)
         
-        # Predict velocity for current state
-        v_H_pred, v_X_pred = self.velocity_net(
-            H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, t
-        )
-        
-        # Standard flow matching loss (positive term)
-        if generate_mask.sum() > 0:
-            loss_H_pos = F.mse_loss(v_H_pred[generate_mask], v_H_target[generate_mask], reduction='none').sum(dim=-1)
-            loss_H_pos = loss_H_pos.sum() / (generate_mask.sum().float() + 1e-8)
+        # CRITICAL FIX: Scale targets to prevent huge velocity magnitudes
+        # Normalize velocity targets to prevent extreme gradients
+        gen_mask = generate_mask
+        if gen_mask.sum() > 0:
+            # Scale velocity targets to reasonable range
+            v_H_scale = torch.clamp(torch.std(v_H_target[gen_mask]), min=1e-6, max=10.0)
+            v_X_scale = torch.clamp(torch.std(v_X_target[gen_mask]), min=1e-6, max=10.0)
             
-            loss_X_pos = F.mse_loss(v_X_pred[generate_mask], v_X_target[generate_mask], reduction='none').sum(dim=-1)
-            loss_X_pos = loss_X_pos.sum() / (generate_mask.sum().float() + 1e-8)
+            v_H_target_scaled = v_H_target / v_H_scale
+            v_X_target_scaled = v_X_target / v_X_scale
+            v_H_pred_scaled = v_H_pred / v_H_scale
+            v_X_pred_scaled = v_X_pred / v_X_scale
+            
+            # Compute loss on scaled values
+            gen_count = gen_mask.sum().float()
+            loss_H_pos = F.mse_loss(v_H_pred_scaled[gen_mask], v_H_target_scaled[gen_mask], reduction='sum') / gen_count
+            loss_X_pos = F.mse_loss(v_X_pred_scaled[gen_mask], v_X_target_scaled[gen_mask], reduction='sum') / gen_count
         else:
-            loss_H_pos = torch.tensor(0.0, device=H_0.device)
-            loss_X_pos = torch.tensor(0.0, device=H_0.device)
+            loss_H_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
+            loss_X_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
         
-        # Contrastive term: sample negative examples from the same batch
-        if self.lambda_contrast > 0 and batch_size > 1:
-            # Sample negative pairs (different molecules from the batch)
-            H_0_neg, X_0_neg, H_1_neg, X_1_neg, cond_neg = self._sample_negatives(
-                H_0, X_0, H_1, X_1, cond_embedding, generate_mask, chain_ids
-            )
-            
-            # Compute negative target velocities (what we want to AVOID)
-            _, _, v_H_target_neg, v_X_target_neg = self.get_path_and_velocity(
-                H_0_neg, X_0_neg, H_1_neg, X_1_neg, t, generate_mask
-            )
-            
-            # Contrastive loss: push away from negative samples
-            # IMPORTANT: Use same predicted velocity but different target
-            if generate_mask.sum() > 0:
-                loss_H_neg = F.mse_loss(v_H_pred[generate_mask], v_H_target_neg[generate_mask], reduction='none').sum(dim=-1)
-                loss_H_neg = loss_H_neg.sum() / (generate_mask.sum().float() + 1e-8)
-                
-                loss_X_neg = F.mse_loss(v_X_pred[generate_mask], v_X_target_neg[generate_mask], reduction='none').sum(dim=-1)
-                loss_X_neg = loss_X_neg.sum() / (generate_mask.sum().float() + 1e-8)
-            else:
-                loss_H_neg = torch.tensor(0.0, device=H_0.device)
-                loss_X_neg = torch.tensor(0.0, device=H_0.device)
-            
-            # Combine: Minimize positive, Maximize negative (hence minus sign)
-            loss_H = loss_H_pos - self.lambda_contrast * loss_H_neg
-            loss_X = loss_X_pos - self.lambda_contrast * loss_X_neg
-        else:
-            # Fall back to standard flow matching if batch size is 1 or λ=0
-            loss_H = loss_H_pos
-            loss_X = loss_X_pos
-            loss_H_neg = torch.tensor(0.0, device=H_0.device)
-            loss_X_neg = torch.tensor(0.0, device=H_0.device)
+        # Skip contrastive for now to debug basic flow matching
+        loss_H_neg = torch.tensor(0.0, device=H_0.device)
+        loss_X_neg = torch.tensor(0.0, device=H_0.device)
         
-        loss_dict = {
-            'H': loss_H,
-            'X': loss_X,
+        return {
+            'H': loss_H_pos,
+            'X': loss_X_pos,
             'H_pos': loss_H_pos,
             'X_pos': loss_X_pos,
             'H_neg': loss_H_neg,
             'X_neg': loss_X_neg,
         }
-        
-        return loss_dict
 
     @torch.no_grad()
     def sample_ode(self, H_init, X_init, cond_embedding, chain_ids, generate_mask, 

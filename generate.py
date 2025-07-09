@@ -64,7 +64,8 @@ def generate_wrapper(model, sample_opt={}):
         def wrapper(batch):
             batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(**batch)
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
-    elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
+    # elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
+    elif isinstance(model, models.RectifiedFlowMolDesign):
         def wrapper(batch):
             res_tuple = model.sample(sample_opt=sample_opt, **batch)
             if len(res_tuple) == 6:
@@ -138,7 +139,7 @@ def main(args, opt_args):
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
     print(f'Using checkpoint {b_ckpt}')
-    model = torch.load(b_ckpt, map_location='cpu')
+    model = torch.load(b_ckpt, map_location='cpu', weights_only=False)
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     model.to(device)
     model.eval()

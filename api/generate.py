@@ -103,7 +103,7 @@ def format_log(cplx_desc: ComplexDesc, details: dict, n: int):
 def generate_for_one_template(model, dataset, n_samples, batch_size, save_dir, device, sample_opt):
     recorder = Recorder(dataset, n_samples, save_dir)
     tmp_save_dir = os.path.join(save_dir, 'tmp')
-    n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
+    n_cycles = 0 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
     
     while not recorder.is_finished():
         batch_list = recorder.get_next_batch_list(batch_size)

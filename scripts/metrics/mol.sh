@@ -3,8 +3,8 @@
 RESULTS_DIR=`realpath $1`
 echo "Evaluating results from $RESULTS_DIR"
 
-CBGBENCH_REPO=/path/to/CBGBench
-DATA_DIR=/path/to/CrossDocked/crossdocked_pocket10
+CBGBENCH_REPO=/home/verma198/Public/CBGBench
+DATA_DIR=/home/verma198/Public/CBGBench/data/crossdocked_test
 
 DATA_DIR=`realpath $DATA_DIR`
 echo "CrossDocked2020 located at $DATA_DIR"
