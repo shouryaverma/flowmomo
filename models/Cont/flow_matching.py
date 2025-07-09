@@ -11,6 +11,9 @@ from utils.nn_utils import SinusoidalTimeEmbeddings
 from ..modules.create_net import create_net
 from ..modules.nn import MLP
 
+def mean_flat(x):
+    """REPA's mean_flat function for proper dimensionality handling"""
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 class VelocityNet(nn.Module):
     """
@@ -127,128 +130,148 @@ class FlowMatching(nn.Module):
 
     def get_path_and_velocity(self, H_0, X_0, H_1, X_1, t, generate_mask):
         """
-        Compute the path and target velocity for flow matching.
-        
-        Args:
-            H_0, X_0: source (noise)
-            H_1, X_1: target (data) 
-            t: time [0, 1]
-            generate_mask: mask for generation
-            
-        Returns:
-            H_t, X_t: interpolated states
-            v_H_target, v_X_target: target velocities
+        Fixed path and velocity computation with proper time handling
         """
-        # Expand time to match feature dimensions
-        t_H = t.view(-1, 1).expand_as(H_0)
-        t_X = t.view(-1, 1).expand_as(X_0)
+        # Ensure proper time dimension handling
+        if t.dim() == 1:
+            t_H = t.unsqueeze(-1)  # [N, 1] for H features
+            t_X = t.unsqueeze(-1)  # [N, 1] for X features  
+        else:
+            t_H = t
+            t_X = t
         
-        # Linear interpolation path: x_t = (1-t) * x_0 + t * x_1
+        # Linear interpolation: x_t = (1-t) * x_0 + t * x_1
         H_t = (1 - t_H) * H_0 + t_H * H_1
         X_t = (1 - t_X) * X_0 + t_X * X_1
         
-        # Target velocity: v = x_1 - x_0 (for rectified flow)
+        # Target velocity for rectified flow: v = x_1 - x_0
         v_H_target = H_1 - H_0
         v_X_target = X_1 - X_0
         
-        # Apply generation mask
-        H_t = torch.where(generate_mask[:, None].expand_as(H_t), H_t, H_1)
-        X_t = torch.where(generate_mask[:, None].expand_as(X_t), X_t, X_1)
+        # Apply generation mask (only modify generated parts)
+        if generate_mask is not None:
+            gen_mask_H = generate_mask.unsqueeze(-1).expand_as(H_t)
+            gen_mask_X = generate_mask.unsqueeze(-1).expand_as(X_t)
+            
+            # For context parts, use target state directly and zero velocity
+            H_t = torch.where(gen_mask_H, H_t, H_1)
+            X_t = torch.where(gen_mask_X, X_t, X_1)
+            v_H_target = torch.where(gen_mask_H, v_H_target, torch.zeros_like(v_H_target))
+            v_X_target = torch.where(gen_mask_X, v_X_target, torch.zeros_like(v_X_target))
         
         return H_t, X_t, v_H_target, v_X_target
 
     def _sample_negatives(self, H_0, X_0, H_1, X_1, cond_embedding, generate_mask, chain_ids):
         """
-        Sample negative examples from the same batch for contrastive learning.
-        
-        IMPROVED: Use molecular properties for smarter negative sampling
+        Improved negative sampling with proper permutation (REPA-style)
         """
         batch_size = H_0.shape[0]
         device = H_0.device
         
-        # Method 1: Random circular shift (simplest and fastest)
-        shift = torch.randint(1, max(2, batch_size), (1,), device=device).item()
-        neg_indices = (torch.arange(batch_size, device=device) + shift) % batch_size
+        if batch_size == 1:
+            # Fallback for single sample - just return the same (no contrastive learning)
+            return H_0, X_0, H_1, X_1, cond_embedding
         
-        # Optional Method 2: For more sophisticated sampling (still vectorized)
         # Create random permutation and ensure no self-matches
-        # perm = torch.randperm(batch_size, device=device)
-        # self_match = perm == torch.arange(batch_size, device=device)
-        # if self_match.any():
-        #     # Fix self-matches by swapping with next element
-        #     fix_idx = torch.where(self_match)[0]
-        #     swap_idx = (fix_idx + 1) % batch_size
-        #     perm[fix_idx], perm[swap_idx] = perm[swap_idx], perm[fix_idx]
-        # neg_indices = perm
+        perm = torch.randperm(batch_size, device=device)
+        
+        # Fix any self-matches by swapping with next element
+        self_match = perm == torch.arange(batch_size, device=device)
+        if self_match.any():
+            fix_idx = torch.where(self_match)[0]
+            swap_idx = (fix_idx + 1) % batch_size
+            perm[fix_idx], perm[swap_idx] = perm[swap_idx], perm[fix_idx]
         
         return (
-            H_0[neg_indices],
-            X_0[neg_indices], 
-            H_1[neg_indices],
-            X_1[neg_indices],
-            cond_embedding[neg_indices]
+            H_0[perm], X_0[perm], H_1[perm], X_1[perm], cond_embedding[perm]
         )
 
     def contrastive_flow_matching_loss(self, H_0, X_0, H_1, X_1, cond_embedding, chain_ids, generate_mask, lengths):
-        """Compute flow matching loss with proper scaling."""
-        
+        """
+        Fixed contrastive flow matching loss with REPA-style computation
+        """
         batch_ids = length_to_batch_id(lengths)
         batch_size = batch_ids.max() + 1
         
         # Check for generation targets
         if generate_mask.sum() == 0:
+            zero_tensor = torch.tensor(0.0, device=H_0.device, requires_grad=True)
             return {
-                'H': torch.tensor(0.0, device=H_0.device, requires_grad=True),
-                'X': torch.tensor(0.0, device=H_0.device, requires_grad=True),
-                'H_pos': torch.tensor(0.0, device=H_0.device),
-                'X_pos': torch.tensor(0.0, device=H_0.device),
-                'H_neg': torch.tensor(0.0, device=H_0.device),
-                'X_neg': torch.tensor(0.0, device=H_0.device),
+                'H': zero_tensor, 'X': zero_tensor,
+                'H_pos': zero_tensor, 'X_pos': zero_tensor,
+                'H_neg': zero_tensor, 'X_neg': zero_tensor,
             }
         
-        # Sample time
-        t = self.sample_time(batch_size, H_0.device)[batch_ids]
+        # Sample time with numerical stability
+        t = torch.rand(batch_size, device=H_0.device)
+        t = torch.clamp(t, min=1e-5, max=1.0-1e-5)  # Avoid exact 0 and 1
+        t = t[batch_ids]  # Expand to node level
         
         # Get path and velocity
-        H_t, X_t, v_H_target, v_X_target = self.get_path_and_velocity(H_0, X_0, H_1, X_1, t, generate_mask)
+        H_t, X_t, v_H_target, v_X_target = self.get_path_and_velocity(
+            H_0, X_0, H_1, X_1, t, generate_mask
+        )
         
-        # Add noise for stability
+        # Add conditional noise for stability
         if self.sigma > 0:
             H_t = H_t + self.sigma * torch.randn_like(H_t)
             X_t = X_t + self.sigma * torch.randn_like(X_t)
         
         # Get edges and predict velocity
         edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
-        v_H_pred, v_X_pred = self.velocity_net(H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, t)
+        v_H_pred, v_X_pred = self.velocity_net(
+            H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, t
+        )
         
-        # CRITICAL FIX: Scale targets to prevent huge velocity magnitudes
-        # Normalize velocity targets to prevent extreme gradients
+        # Positive loss computation (REPA-style with mean_flat)
         gen_mask = generate_mask
         if gen_mask.sum() > 0:
-            # Scale velocity targets to reasonable range
-            v_H_scale = torch.clamp(torch.std(v_H_target[gen_mask]), min=1e-6, max=10.0)
-            v_X_scale = torch.clamp(torch.std(v_X_target[gen_mask]), min=1e-6, max=10.0)
+            # Use mean_flat for proper dimensionality reduction
+            h_error = (v_H_pred[gen_mask] - v_H_target[gen_mask]) ** 2
+            x_error = (v_X_pred[gen_mask] - v_X_target[gen_mask]) ** 2
             
-            v_H_target_scaled = v_H_target / v_H_scale
-            v_X_target_scaled = v_X_target / v_X_scale
-            v_H_pred_scaled = v_H_pred / v_H_scale
-            v_X_pred_scaled = v_X_pred / v_X_scale
-            
-            # Compute loss on scaled values
-            gen_count = gen_mask.sum().float()
-            loss_H_pos = F.mse_loss(v_H_pred_scaled[gen_mask], v_H_target_scaled[gen_mask], reduction='sum') / gen_count
-            loss_X_pos = F.mse_loss(v_X_pred_scaled[gen_mask], v_X_target_scaled[gen_mask], reduction='sum') / gen_count
+            loss_H_pos = mean_flat(h_error).mean()
+            loss_X_pos = mean_flat(x_error).mean()
         else:
             loss_H_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
             loss_X_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
         
-        # Skip contrastive for now to debug basic flow matching
-        loss_H_neg = torch.tensor(0.0, device=H_0.device)
-        loss_X_neg = torch.tensor(0.0, device=H_0.device)
+        # Contrastive term (FIXED - now actually enabled)
+        if self.lambda_contrast > 0 and batch_size > 1:
+            # Sample negative examples
+            H_0_neg, X_0_neg, H_1_neg, X_1_neg, cond_neg = self._sample_negatives(
+                H_0, X_0, H_1, X_1, cond_embedding, generate_mask, chain_ids
+            )
+            
+            # Compute negative target velocities
+            _, _, v_H_target_neg, v_X_target_neg = self.get_path_and_velocity(
+                H_0_neg, X_0_neg, H_1_neg, X_1_neg, t, generate_mask
+            )
+            
+            # Negative loss (same predicted velocity, different target)
+            if gen_mask.sum() > 0:
+                h_error_neg = (v_H_pred[gen_mask] - v_H_target_neg[gen_mask]) ** 2
+                x_error_neg = (v_X_pred[gen_mask] - v_X_target_neg[gen_mask]) ** 2
+                
+                loss_H_neg = mean_flat(h_error_neg).mean()
+                loss_X_neg = mean_flat(x_error_neg).mean()
+            else:
+                loss_H_neg = torch.tensor(0.0, device=H_0.device)
+                loss_X_neg = torch.tensor(0.0, device=H_0.device)
+            
+            # REPA-style contrastive combination
+            loss_H = loss_H_pos - self.lambda_contrast * loss_H_neg
+            loss_X = loss_X_pos - self.lambda_contrast * loss_X_neg
+        else:
+            # Standard flow matching (no contrastive)
+            loss_H = loss_H_pos
+            loss_X = loss_X_pos
+            loss_H_neg = torch.tensor(0.0, device=H_0.device)
+            loss_X_neg = torch.tensor(0.0, device=H_0.device)
         
         return {
-            'H': loss_H_pos,
-            'X': loss_X_pos,
+            'H': loss_H,
+            'X': loss_X,
             'H_pos': loss_H_pos,
             'X_pos': loss_X_pos,
             'H_neg': loss_H_neg,
