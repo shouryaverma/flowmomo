@@ -11,9 +11,6 @@ from utils.nn_utils import SinusoidalTimeEmbeddings
 from ..modules.create_net import create_net
 from ..modules.nn import MLP
 
-def mean_flat(x):
-    """REPA's mean_flat function for proper dimensionality handling"""
-    return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 class VelocityNet(nn.Module):
     """
@@ -87,9 +84,8 @@ class VelocityNet(nn.Module):
 
 class FlowMatching(nn.Module):
     """
-    Contrastive Flow Matching for molecular design.
-    Extends standard flow matching with contrastive regularization to encourage
-    distinct flows for different molecular conditions.
+    Simplified Flow Matching for molecular design.
+    FIXED: Removed contrastive learning, uses simple MSE loss like LDM.
     """
     
     def __init__(
@@ -99,7 +95,7 @@ class FlowMatching(nn.Module):
         encoder_type='EPT',
         encoder_opt={},
         sigma=1e-4,
-        lambda_contrast=0.05,  # Contrastive weight (λ in paper)
+        lambda_contrast=0.0,  # FIXED: Default to 0 (no contrastive)
     ):
         super().__init__()
         self.velocity_net = VelocityNet(latent_size, hidden_size, encoder_type, encoder_opt)
@@ -124,13 +120,9 @@ class FlowMatching(nn.Module):
         edge_types = torch.cat([torch.zeros_like(ctx_edges[0]), torch.ones_like(inter_edges[0])], dim=0)
         return edges, edge_types
 
-    def sample_time(self, batch_size, device):
-        """Sample random time points."""
-        return torch.rand(batch_size, device=device)
-
     def get_path_and_velocity(self, H_0, X_0, H_1, X_1, t, generate_mask):
         """
-        Fixed path and velocity computation with proper time handling
+        FIXED: Simple path and velocity computation
         """
         # Ensure proper time dimension handling
         if t.dim() == 1:
@@ -161,34 +153,9 @@ class FlowMatching(nn.Module):
         
         return H_t, X_t, v_H_target, v_X_target
 
-    def _sample_negatives(self, H_0, X_0, H_1, X_1, cond_embedding, generate_mask, chain_ids):
-        """
-        Improved negative sampling with proper permutation (REPA-style)
-        """
-        batch_size = H_0.shape[0]
-        device = H_0.device
-        
-        if batch_size == 1:
-            # Fallback for single sample - just return the same (no contrastive learning)
-            return H_0, X_0, H_1, X_1, cond_embedding
-        
-        # Create random permutation and ensure no self-matches
-        perm = torch.randperm(batch_size, device=device)
-        
-        # Fix any self-matches by swapping with next element
-        self_match = perm == torch.arange(batch_size, device=device)
-        if self_match.any():
-            fix_idx = torch.where(self_match)[0]
-            swap_idx = (fix_idx + 1) % batch_size
-            perm[fix_idx], perm[swap_idx] = perm[swap_idx], perm[fix_idx]
-        
-        return (
-            H_0[perm], X_0[perm], H_1[perm], X_1[perm], cond_embedding[perm]
-        )
-
     def contrastive_flow_matching_loss(self, H_0, X_0, H_1, X_1, cond_embedding, chain_ids, generate_mask, lengths):
         """
-        Fixed contrastive flow matching loss with REPA-style computation
+        FIXED: Simplified flow matching loss using MSE like LDM (no contrastive)
         """
         batch_ids = length_to_batch_id(lengths)
         batch_size = batch_ids.max() + 1
@@ -223,68 +190,35 @@ class FlowMatching(nn.Module):
             H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, t
         )
         
-        # Positive loss computation (REPA-style with mean_flat)
+        # FIXED: Simple MSE loss like LDM
         gen_mask = generate_mask
         if gen_mask.sum() > 0:
-            # Use mean_flat for proper dimensionality reduction
-            h_error = (v_H_pred[gen_mask] - v_H_target[gen_mask]) ** 2
-            x_error = (v_X_pred[gen_mask] - v_X_target[gen_mask]) ** 2
+            # Use simple MSE reduction='none' then mean like LDM
+            h_error = F.mse_loss(v_H_pred[gen_mask], v_H_target[gen_mask], reduction='none')
+            x_error = F.mse_loss(v_X_pred[gen_mask], v_X_target[gen_mask], reduction='none')
             
-            loss_H_pos = mean_flat(h_error).mean()
-            loss_X_pos = mean_flat(x_error).mean()
+            # Sum over feature dimensions and average over nodes (like LDM)
+            loss_H = h_error.sum(-1).mean()
+            loss_X = x_error.sum(-1).mean()
         else:
-            loss_H_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
-            loss_X_pos = torch.tensor(0.0, device=H_0.device, requires_grad=True)
+            loss_H = torch.tensor(0.0, device=H_0.device, requires_grad=True)
+            loss_X = torch.tensor(0.0, device=H_0.device, requires_grad=True)
         
-        # Contrastive term (FIXED - now actually enabled)
-        if self.lambda_contrast > 0 and batch_size > 1:
-            # Sample negative examples
-            H_0_neg, X_0_neg, H_1_neg, X_1_neg, cond_neg = self._sample_negatives(
-                H_0, X_0, H_1, X_1, cond_embedding, generate_mask, chain_ids
-            )
-            
-            # Compute negative target velocities
-            _, _, v_H_target_neg, v_X_target_neg = self.get_path_and_velocity(
-                H_0_neg, X_0_neg, H_1_neg, X_1_neg, t, generate_mask
-            )
-            
-            # Negative loss (same predicted velocity, different target)
-            if gen_mask.sum() > 0:
-                h_error_neg = (v_H_pred[gen_mask] - v_H_target_neg[gen_mask]) ** 2
-                x_error_neg = (v_X_pred[gen_mask] - v_X_target_neg[gen_mask]) ** 2
-                
-                loss_H_neg = mean_flat(h_error_neg).mean()
-                loss_X_neg = mean_flat(x_error_neg).mean()
-            else:
-                loss_H_neg = torch.tensor(0.0, device=H_0.device)
-                loss_X_neg = torch.tensor(0.0, device=H_0.device)
-            
-            # REPA-style contrastive combination
-            loss_H = loss_H_pos - self.lambda_contrast * loss_H_neg
-            loss_X = loss_X_pos - self.lambda_contrast * loss_X_neg
-        else:
-            # Standard flow matching (no contrastive)
-            loss_H = loss_H_pos
-            loss_X = loss_X_pos
-            loss_H_neg = torch.tensor(0.0, device=H_0.device)
-            loss_X_neg = torch.tensor(0.0, device=H_0.device)
-        
+        # FIXED: No contrastive learning (simplified)
         return {
             'H': loss_H,
             'X': loss_X,
-            'H_pos': loss_H_pos,
-            'X_pos': loss_X_pos,
-            'H_neg': loss_H_neg,
-            'X_neg': loss_X_neg,
+            'H_pos': loss_H,  # For compatibility
+            'X_pos': loss_X,  # For compatibility
+            'H_neg': torch.tensor(0.0, device=H_0.device),  # Zero for no contrastive
+            'X_neg': torch.tensor(0.0, device=H_0.device),  # Zero for no contrastive
         }
 
     @torch.no_grad()
     def sample_ode(self, H_init, X_init, cond_embedding, chain_ids, generate_mask, 
                    lengths, num_steps=50, method='euler', pbar=False):
         """
-        Sample from the flow by solving the ODE.
-        
-        FIXED: Added missing sampling method for inference
+        FIXED: Improved ODE sampling with better numerical stability
         """
         batch_ids = length_to_batch_id(lengths)
         dt = 1.0 / num_steps
@@ -296,13 +230,14 @@ class FlowMatching(nn.Module):
         traj = {0: (H_init.clone(), X_init.clone())}
         
         if pbar:
-            pbar_fn = functools.partial(tqdm, total=num_steps, desc='Contrastive Flow Sampling')
+            pbar_fn = functools.partial(tqdm, total=num_steps, desc='Flow Sampling')
         else:
             pbar_fn = lambda x: x
         
         H_t, X_t = H_init.clone(), X_init.clone()
         
         for step in pbar_fn(range(num_steps)):
+            # Use midpoint time for better accuracy
             t = torch.full_like(batch_ids, (step + 0.5) / num_steps, dtype=torch.float)
             
             if method == 'euler':
@@ -335,6 +270,10 @@ class FlowMatching(nn.Module):
             # Apply generation mask
             H_t = torch.where(generate_mask[:, None].expand_as(H_t), H_t, H_init)
             X_t = torch.where(generate_mask[:, None].expand_as(X_t), X_t, X_init)
+            
+            # Add numerical stability clipping
+            H_t = torch.clamp(H_t, -10, 10)
+            X_t = torch.clamp(X_t, -10, 10)
             
             traj[step + 1] = (H_t.clone(), X_t.clone())
         

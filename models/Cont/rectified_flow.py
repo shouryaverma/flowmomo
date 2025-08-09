@@ -21,7 +21,7 @@ from ..modules.nn import GINEConv, MLP
 class RectifiedFlowMolDesign(nn.Module):
     """
     Rectified Flow-based molecular design model.
-    Uses VAE + Rectified Flow with optional Contrastive Flow Matching for molecular generation.
+    Uses VAE + Rectified Flow for molecular generation.
     """
 
     def __init__(
@@ -36,7 +36,7 @@ class RectifiedFlowMolDesign(nn.Module):
                 'encoder_type': 'EPT',
                 'encoder_opt': {'n_layers': 3},
                 'sigma': 1e-4,
-                'lambda_contrast': 0.05,  # Default: standard flow matching
+                'lambda_contrast': 0.0,  # FIXED: Disable contrastive learning
             }
         ):
         super().__init__()
@@ -68,30 +68,16 @@ class RectifiedFlowMolDesign(nn.Module):
             dropout=0.1
         )
 
-        # Choose flow matching type based on lambda_contrast
-        lambda_contrast = flow_opt.get('lambda_contrast', 0.05)
-        self.use_contrastive = lambda_contrast > 0.0
+        # Initialize flow matching with simplified settings
+        self.flow_matching = FlowMatching(
+            latent_size=latent_size,
+            hidden_size=hidden_size,
+            **flow_opt
+        )
         
-        if self.use_contrastive:
-            print(f"🚀 Using Contrastive Flow Matching with λ={lambda_contrast}")
-            self.flow_matching = FlowMatching(
-                latent_size=latent_size,
-                hidden_size=hidden_size,
-                **flow_opt
-            )
-        else:
-            print("📋 Using standard Flow Matching")
-            # Remove lambda_contrast for standard flow matching
-            standard_flow_opt = {k: v for k, v in flow_opt.items() if k != 'lambda_contrast'}
-            self.flow_matching = FlowMatching(
-                latent_size=latent_size,
-                hidden_size=hidden_size,
-                **standard_flow_opt
-            )
-        
-        # Loss weighting
+        # Loss weighting - match LDM exactly
         if h_loss_weight is None:
-            self.h_loss_weight = 3 / latent_size  # make loss_X and loss_H about the same size
+            self.h_loss_weight = 3 / latent_size
         else:
             self.h_loss_weight = float(h_loss_weight)
             
@@ -101,14 +87,14 @@ class RectifiedFlowMolDesign(nn.Module):
     @oom_decorator
     def forward(self, X, S, A, bonds, position_ids, chain_ids, generate_mask, center_mask, block_lengths, lengths, is_aa):
         """
-        Forward pass - FIXED to match LDM's autoencoder usage exactly
+        Forward pass - FIXED to use proper prior distributions
         """
         
-        # CRITICAL FIX: Use the same encoding strategy as LDM
+        # Use the same encoding strategy as LDM
         with torch.no_grad():
             self.autoencoder.eval()
             Zh_1, Zx_1, _, _, _, _, _, _ = self.autoencoder.encode(
-                X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,  # Use actual generate_mask like LDM
+                X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,
                 deterministic=self.latent_deterministic
             )
 
@@ -116,10 +102,9 @@ class RectifiedFlowMolDesign(nn.Module):
         batch_ids = length_to_batch_id(lengths)
         Zx_1, centers = self._normalize_position(Zx_1, batch_ids, center_mask)
 
-        # Sample noise as source distribution - SCALE TO MATCH LATENT MAGNITUDES
-        # Use same scale as the encoded latents to prevent magnitude mismatch
-        Zh_0 = torch.randn_like(Zh_1) * torch.std(Zh_1).detach()  # Match latent scale
-        Zx_0 = torch.randn_like(Zx_1) * torch.std(Zx_1).detach()  # Match position scale
+        # CRITICAL FIX: Use standard Gaussian priors like LDM (no scaling!)
+        Zh_0 = torch.randn_like(Zh_1)  # Standard Gaussian for sequence latents
+        Zx_0 = torch.randn_like(Zx_1)  # Standard Gaussian for coordinate latents
 
         # Get conditional embeddings (same as LDM)
         position_embedding = self.position_encoding(position_ids)
@@ -141,7 +126,7 @@ class RectifiedFlowMolDesign(nn.Module):
             generate_mask=generate_mask, lengths=lengths
         )
 
-        # CRITICAL: Use same loss weighting strategy as LDM
+        # Use same loss weighting strategy as LDM
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
         return loss_dict
@@ -191,7 +176,7 @@ class RectifiedFlowMolDesign(nn.Module):
     @torch.no_grad()
     def sample(self, X, S, A, bonds, position_ids, chain_ids, generate_mask, center_mask, block_lengths, lengths, is_aa, sample_opt={}, return_tensor=False):
         """
-        Sample - FIXED to match LDM's data preparation exactly
+        Sample - FIXED to use proper initialization
         """
         
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
@@ -199,7 +184,7 @@ class RectifiedFlowMolDesign(nn.Module):
 
         block_ids = length_to_batch_id(block_lengths)
 
-        # CRITICAL FIX: Use exactly the same data preparation as LDM
+        # Use exactly the same data preparation as LDM
         S[generate_mask] = 0
         X[generate_mask[block_ids]] = 0
         A[generate_mask[block_ids]] = 0
@@ -209,7 +194,7 @@ class RectifiedFlowMolDesign(nn.Module):
         # Encode context using the same strategy as LDM
         self.autoencoder.eval()
         Zh_ctx, Zx_ctx, _, _, _, _, _, _ = self.autoencoder.encode(
-            X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,  # Use actual generate_mask like LDM
+            X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,
             deterministic=self.latent_deterministic
         )
 
@@ -217,15 +202,15 @@ class RectifiedFlowMolDesign(nn.Module):
         batch_ids = length_to_batch_id(lengths)
         Zx_ctx, centers = self._normalize_position(Zx_ctx, batch_ids, center_mask)
 
-        # Initialize with noise for generation parts (same pattern as LDM)
+        # CRITICAL FIX: Initialize with standard Gaussian for generation parts
         Zh_init = torch.where(
             generate_mask[:, None].expand_as(Zh_ctx),
-            torch.randn_like(Zh_ctx),
+            torch.randn_like(Zh_ctx),  # Standard Gaussian (no scaling!)
             Zh_ctx
         )
         Zx_init = torch.where(
             generate_mask[:, None].expand_as(Zx_ctx),
-            torch.randn_like(Zx_ctx),
+            torch.randn_like(Zx_ctx),  # Standard Gaussian (no scaling!)
             Zx_ctx
         )
 
@@ -264,7 +249,6 @@ class RectifiedFlowMolDesign(nn.Module):
     def get_trajectory(self, *args, **kwargs):
         """
         Get the full sampling trajectory for analysis.
-        Similar to sample() but returns the full trajectory.
         """
         # Remove return_tensor and vae_decode_n_iter from kwargs for flow sampling
         sample_opt = kwargs.pop('sample_opt', {})
@@ -294,6 +278,7 @@ class RectifiedFlowMolDesign(nn.Module):
         batch_ids = length_to_batch_id(lengths)
         Zx_ctx, centers = self._normalize_position(Zx_ctx, batch_ids, center_mask)
         
+        # FIXED: Standard Gaussian initialization
         Zh_init = torch.where(generate_mask[:, None].expand_as(Zh_ctx), torch.randn_like(Zh_ctx), Zh_ctx)
         Zx_init = torch.where(generate_mask[:, None].expand_as(Zx_ctx), torch.randn_like(Zx_ctx), Zx_ctx)
 

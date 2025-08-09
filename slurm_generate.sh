@@ -21,11 +21,11 @@ export CUDA_LAUNCH_BLOCKING=1
 cd /depot/natallah/data/shourya/flowmomo
 
 # # peptide
-# python generate.py --config configs/test/test_pep.yaml --ckpt /depot/natallah/data/shourya/flowmomo/ckpts/unimomo/Flow_unimomo/previous1/checkpoint/epoch136_step32469.ckpt --gpu 0 --save_dir ./results/pep
+python generate.py --config configs/test/test_pep.yaml --ckpt /depot/natallah/data/shourya/flowmomo/ckpts/unimomo/Flow_unimomo/version_0/checkpoint/epoch39_step9480.ckpt --gpu 0 --save_dir ./results/pep
 # # antibody
 # python generate.py --config configs/test/test_ab.yaml --ckpt /depot/natallah/data/shourya/flowmomo/ckpts/unimomo/Flow_unimomo/previous1/checkpoint/epoch136_step32469.ckpt --gpu 0 --save_dir ./results/ab
 # # small molecule
-python generate.py --config configs/test/test_mol.yaml --ckpt /depot/natallah/data/shourya/flowmomo/ckpts/unimomo/Flow_unimomo/previous1/checkpoint/epoch136_step32469.ckpt --gpu 0 --save_dir ./results/mol
+# python generate.py --config configs/test/test_mol.yaml --ckpt /depot/natallah/data/shourya/flowmomo/ckpts/unimomo/Flow_unimomo/previous1/checkpoint/epoch136_step32469.ckpt --gpu 0 --save_dir ./results/mol
 
 ends=$(date +"%s")
 end=$(date +"%r, %m-%d-%Y")
