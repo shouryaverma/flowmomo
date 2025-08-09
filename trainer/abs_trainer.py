@@ -21,7 +21,7 @@ from utils.logger import print_log
 class TrainConfig:
     def __init__(self, save_dir, max_epoch, warmup=0,
                  metric_min_better=True, patience=3,
-                 grad_clip=None, save_topk=-1,  # -1 for save all
+                 grad_clip=1.0, save_topk=-1,  # -1 for save all
                  grad_interval=1,  # parameter update interval
                  val_freq=1,       # frequence for validation
                  logger=None,
@@ -127,7 +127,8 @@ class Trainer:
                 loss = loss.fake_loss
             elif torch.isnan(loss):
                 print_log(f'Loss is nan, local_rank {self.local_rank}', level='WARN')
-                loss = sum([p.norm() for p in self.model.parameters() if p.dtype == torch.float]) * 0.0
+                # loss = sum([p.norm() for p in self.model.parameters() if p.dtype == torch.float]) * 0.0
+                continue
             self.optimizer.zero_grad()
             backward_ok = safe_backward(loss, self.model)
             if not backward_ok:

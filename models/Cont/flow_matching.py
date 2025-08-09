@@ -139,7 +139,11 @@ class FlowMatching(nn.Module):
         # Target velocity for rectified flow: v = x_1 - x_0
         v_H_target = H_1 - H_0
         v_X_target = X_1 - X_0
-        
+
+        # Clamp extreme velocities
+        v_H_target = torch.clamp(v_H_target, min=-10.0, max=10.0)
+        v_X_target = torch.clamp(v_X_target, min=-10.0, max=10.0)
+
         # Apply generation mask (only modify generated parts)
         if generate_mask is not None:
             gen_mask_H = generate_mask.unsqueeze(-1).expand_as(H_t)
@@ -171,7 +175,7 @@ class FlowMatching(nn.Module):
         
         # Sample time with numerical stability
         t = torch.rand(batch_size, device=H_0.device)
-        t = torch.clamp(t, min=1e-5, max=1.0-1e-5)  # Avoid exact 0 and 1
+        t = torch.clamp(t, min=1e-3, max=1.0-1e-3)  # Avoid exact 0 and 1
         t = t[batch_ids]  # Expand to node level
         
         # Get path and velocity
