@@ -9,3 +9,11 @@ dataloader:
 
 n_samples: 100
 n_cycles: 0
+
+# ADD THIS SECTION:
+sample_opt:
+  num_steps: 50
+  method: 'euler'
+  guidance_scale: 1.0
+  vae_decode_n_iter: 10
+  pbar: false

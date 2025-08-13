@@ -11,8 +11,8 @@ from utils.oom_decorator import oom_decorator
 from utils.nn_utils import SinusoidalPositionEmbedding
 from utils.gnn_utils import length_to_batch_id, std_conserve_scatter_mean
 
-# Import both for backward compatibility
-from .flow_matching import FlowMatching  # Original
+# Import FIXED flow matching
+from .flow_matching import FlowMatching
 from ..IterVAE.model import CondIterAutoEncoder
 from ..modules.nn import GINEConv, MLP
 
@@ -20,8 +20,8 @@ from ..modules.nn import GINEConv, MLP
 @R.register('RectifiedFlowMolDesign')
 class RectifiedFlowMolDesign(nn.Module):
     """
-    Rectified Flow-based molecular design model.
-    Uses VAE + Rectified Flow for molecular generation.
+    FIXED Rectified Flow-based molecular design model.
+    Now works directly on IterVAE latents without LDM.
     """
 
     def __init__(
@@ -36,7 +36,9 @@ class RectifiedFlowMolDesign(nn.Module):
                 'encoder_type': 'EPT',
                 'encoder_opt': {'n_layers': 3},
                 'sigma': 1e-4,
-                'lambda_contrast': 0.0,  # FIXED: Disable contrastive learning
+                'p_uncond': 0.1,
+                'use_ot_coupling': True,  # FIXED: Always enabled
+                'time_weighting': 'uniform',  # FIXED: Start simple
             }
         ):
         super().__init__()
@@ -50,32 +52,32 @@ class RectifiedFlowMolDesign(nn.Module):
         
         latent_size = self.autoencoder.latent_size
 
-        # Topology embedding components
-        self.bond_embed = nn.Embedding(5, hidden_size)  # [None, single, double, triple, aromatic]
+        # Topology embedding components (same as LDM)
+        self.bond_embed = nn.Embedding(5, hidden_size)
         self.atom_embed = nn.Embedding(VOCAB.get_num_atom_type(), hidden_size)
         self.topo_gnn = GINEConv(hidden_size, hidden_size, hidden_size, hidden_size)
 
-        # Positional and context embeddings
+        # Positional and context embeddings (same as LDM)
         self.position_encoding = SinusoidalPositionEmbedding(hidden_size)
-        self.is_aa_embed = nn.Embedding(2, hidden_size)  # is or is not standard amino acid
+        self.is_aa_embed = nn.Embedding(2, hidden_size)
 
-        # Condition embedding MLP
+        # Condition embedding MLP (same as LDM)
         self.cond_mlp = MLP(
-            input_size=3 * hidden_size,  # [position, topo, is_aa]
+            input_size=3 * hidden_size,
             hidden_size=hidden_size,
             output_size=hidden_size,
             n_layers=3,
             dropout=0.1
         )
 
-        # Initialize flow matching with simplified settings
+        # FIXED: Initialize flow matching with simplified settings
         self.flow_matching = FlowMatching(
             latent_size=latent_size,
             hidden_size=hidden_size,
             **flow_opt
         )
         
-        # Loss weighting - match LDM exactly
+        # Loss weighting (same as LDM)
         if h_loss_weight is None:
             self.h_loss_weight = 3 / latent_size
         else:
@@ -87,10 +89,10 @@ class RectifiedFlowMolDesign(nn.Module):
     @oom_decorator
     def forward(self, X, S, A, bonds, position_ids, chain_ids, generate_mask, center_mask, block_lengths, lengths, is_aa):
         """
-        Forward pass - FIXED to use proper prior distributions
+        FIXED forward pass - much simpler now
         """
         
-        # Use the same encoding strategy as LDM
+        # Encode using frozen autoencoder (same as LDM)
         with torch.no_grad():
             self.autoencoder.eval()
             Zh_1, Zx_1, _, _, _, _, _, _ = self.autoencoder.encode(
@@ -101,10 +103,6 @@ class RectifiedFlowMolDesign(nn.Module):
         # Normalize positions (same as LDM)
         batch_ids = length_to_batch_id(lengths)
         Zx_1, centers = self._normalize_position(Zx_1, batch_ids, center_mask)
-
-        # CRITICAL FIX: Use standard Gaussian priors like LDM (no scaling!)
-        Zh_0 = torch.randn_like(Zh_1)  # Standard Gaussian for sequence latents
-        Zx_0 = torch.randn_like(Zx_1)  # Standard Gaussian for coordinate latents
 
         # Get conditional embeddings (same as LDM)
         position_embedding = self.position_encoding(position_ids)
@@ -119,22 +117,21 @@ class RectifiedFlowMolDesign(nn.Module):
         # Combine conditional information (same as LDM)
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
 
-        # Compute flow matching loss
-        loss_dict = self.flow_matching(
-            H_0=Zh_0, X_0=Zx_0, H_1=Zh_1, X_1=Zx_1,
+        # FIXED: Flow matching handles everything internally now
+        loss_dict = self.flow_matching.contrastive_flow_matching_loss(
+            H_0=None, X_0=None, H_1=Zh_1, X_1=Zx_1,  # H_0, X_0 will be sampled internally
             cond_embedding=cond_embedding, chain_ids=chain_ids,
             generate_mask=generate_mask, lengths=lengths
         )
 
-        # Use same loss weighting strategy as LDM
+        # Same loss weighting as LDM
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
         return loss_dict
 
     def topo_embedding(self, A, bonds, block_ids, generate_mask):
         """
-        Generate topology embeddings from molecular structure.
-        Only uses context (non-generation) parts for topology information.
+        Generate topology embeddings (same as LDM)
         """
         ctx_mask = ~generate_mask[block_ids]
 
@@ -152,7 +149,7 @@ class RectifiedFlowMolDesign(nn.Module):
         # Aggregate to block level
         topo_embedding = std_conserve_scatter_mean(topo_embedding, block_ids, dim=0)  # [Nblock]
 
-        # Set generation part to zero (no topology information for generation)
+        # Set generation part to zero
         topo_embedding = torch.where(
             generate_mask[:, None].expand_as(topo_embedding),
             torch.zeros_like(topo_embedding),
@@ -162,36 +159,37 @@ class RectifiedFlowMolDesign(nn.Module):
         return topo_embedding
 
     def _normalize_position(self, X, batch_ids, center_mask):
-        """Normalize positions by centering and scaling."""
-        centers = scatter_mean(X[center_mask], batch_ids[center_mask], dim=0, dim_size=batch_ids.max() + 1)  # [bs, 3]
-        centers = centers[batch_ids]  # [N, 3]
+        """Normalize positions (same as LDM)"""
+        centers = scatter_mean(X[center_mask], batch_ids[center_mask], dim=0, dim_size=batch_ids.max() + 1)
+        centers = centers[batch_ids]
         X = (X - centers) / self.std
         return X, centers
 
     def _unnormalize_position(self, X_norm, centers, batch_ids):
-        """Unnormalize positions."""
+        """Unnormalize positions (same as LDM)"""
         X = X_norm * self.std + centers
         return X
 
     @torch.no_grad()
     def sample(self, X, S, A, bonds, position_ids, chain_ids, generate_mask, center_mask, block_lengths, lengths, is_aa, sample_opt={}, return_tensor=False):
         """
-        Sample - FIXED to use proper initialization
+        FIXED sampling - much simpler and more reliable
         """
         
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
-        flow_sample_opt = {k: v for k, v in sample_opt.items() if k != 'vae_decode_n_iter'}
+        guidance_scale = sample_opt.pop('guidance_scale', 1.0)
+        flow_sample_opt = {k: v for k, v in sample_opt.items() if k not in ['vae_decode_n_iter', 'guidance_scale']}
 
         block_ids = length_to_batch_id(block_lengths)
 
-        # Use exactly the same data preparation as LDM
+        # Data preparation (same as LDM)
         S[generate_mask] = 0
         X[generate_mask[block_ids]] = 0
         A[generate_mask[block_ids]] = 0
         ctx_atom_mask = ~generate_mask[block_ids]
         bonds = bonds[ctx_atom_mask[bonds[:, 0]] & ctx_atom_mask[bonds[:, 1]]]
 
-        # Encode context using the same strategy as LDM
+        # Encode context (same as LDM)
         self.autoencoder.eval()
         Zh_ctx, Zx_ctx, _, _, _, _, _, _ = self.autoencoder.encode(
             X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,
@@ -202,17 +200,23 @@ class RectifiedFlowMolDesign(nn.Module):
         batch_ids = length_to_batch_id(lengths)
         Zx_ctx, centers = self._normalize_position(Zx_ctx, batch_ids, center_mask)
 
-        # CRITICAL FIX: Initialize with standard Gaussian for generation parts
-        Zh_init = torch.where(
-            generate_mask[:, None].expand_as(Zh_ctx),
-            torch.randn_like(Zh_ctx),  # Standard Gaussian (no scaling!)
-            Zh_ctx
-        )
-        Zx_init = torch.where(
-            generate_mask[:, None].expand_as(Zx_ctx),
-            torch.randn_like(Zx_ctx),  # Standard Gaussian (no scaling!)
-            Zx_ctx
-        )
+        # FIXED: Simple prior sampling based on molecular size
+        if generate_mask.sum() > 0:
+            gen_indices = torch.nonzero(generate_mask, as_tuple=False).squeeze(-1)
+            
+            # Sample priors for generated parts
+            Zh_gen_init, Zx_gen_init = self.flow_matching.sample_molecular_prior(
+                Zh_ctx[gen_indices].shape, Zx_ctx[gen_indices].shape, Zh_ctx.device, block_lengths
+            )
+            
+            # Combine with context
+            Zh_init = Zh_ctx.clone()
+            Zx_init = Zx_ctx.clone()
+            Zh_init[gen_indices] = Zh_gen_init
+            Zx_init[gen_indices] = Zx_gen_init
+        else:
+            Zh_init = Zh_ctx
+            Zx_init = Zx_ctx
 
         # Get conditional embeddings (same as LDM)
         topo_embedding = self.topo_embedding(A, bonds, length_to_batch_id(block_lengths), generate_mask)
@@ -220,10 +224,11 @@ class RectifiedFlowMolDesign(nn.Module):
         is_aa_embedding = self.is_aa_embed(is_aa.long())
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
         
-        # Sample using flow matching
+        # FIXED: Sample using flow matching
         traj = self.flow_matching.sample_ode(
             H_init=Zh_init, X_init=Zx_init, cond_embedding=cond_embedding,
             chain_ids=chain_ids, generate_mask=generate_mask, lengths=lengths,
+            guidance_scale=guidance_scale,
             **flow_sample_opt
         )
         
@@ -248,19 +253,20 @@ class RectifiedFlowMolDesign(nn.Module):
 
     def get_trajectory(self, *args, **kwargs):
         """
-        Get the full sampling trajectory for analysis.
+        FIXED trajectory sampling
         """
-        # Remove return_tensor and vae_decode_n_iter from kwargs for flow sampling
+        # Remove special kwargs
         sample_opt = kwargs.pop('sample_opt', {})
-        flow_sample_opt = {k: v for k, v in sample_opt.items() if k not in ['vae_decode_n_iter', 'return_tensor']}
+        guidance_scale = sample_opt.pop('guidance_scale', 1.0)
+        flow_sample_opt = {k: v for k, v in sample_opt.items() if k not in ['vae_decode_n_iter', 'return_tensor', 'guidance_scale']}
         
-        # Get all the arguments from sample method
+        # Get arguments
         (X, S, A, bonds, position_ids, chain_ids, generate_mask, center_mask, 
-         block_lengths, lengths, is_aa) = args
+        block_lengths, lengths, is_aa) = args
         
         block_ids = length_to_batch_id(block_lengths)
         
-        # Ensure no data leakage
+        # Data preparation
         S[generate_mask] = 0
         X[generate_mask[block_ids]] = 0
         A[generate_mask[block_ids]] = 0
@@ -278,9 +284,21 @@ class RectifiedFlowMolDesign(nn.Module):
         batch_ids = length_to_batch_id(lengths)
         Zx_ctx, centers = self._normalize_position(Zx_ctx, batch_ids, center_mask)
         
-        # FIXED: Standard Gaussian initialization
-        Zh_init = torch.where(generate_mask[:, None].expand_as(Zh_ctx), torch.randn_like(Zh_ctx), Zh_ctx)
-        Zx_init = torch.where(generate_mask[:, None].expand_as(Zx_ctx), torch.randn_like(Zx_ctx), Zx_ctx)
+        # Sample initial states
+        if generate_mask.sum() > 0:
+            gen_indices = torch.nonzero(generate_mask, as_tuple=False).squeeze(-1)
+            
+            Zh_gen_init, Zx_gen_init = self.flow_matching.sample_molecular_prior(
+                Zh_ctx[gen_indices].shape, Zx_ctx[gen_indices].shape, Zh_ctx.device, block_lengths
+            )
+            
+            Zh_init = Zh_ctx.clone()
+            Zx_init = Zx_ctx.clone()
+            Zh_init[gen_indices] = Zh_gen_init
+            Zx_init[gen_indices] = Zx_gen_init
+        else:
+            Zh_init = Zh_ctx
+            Zx_init = Zx_ctx
 
         # Get embeddings
         topo_embedding = self.topo_embedding(A, bonds, length_to_batch_id(block_lengths), generate_mask)
@@ -288,7 +306,7 @@ class RectifiedFlowMolDesign(nn.Module):
         is_aa_embedding = self.is_aa_embed(is_aa.long())
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
         
-        # Get full trajectory
+        # Get trajectory
         traj = self.flow_matching.sample_ode(
             H_init=Zh_init,
             X_init=Zx_init,
@@ -296,6 +314,7 @@ class RectifiedFlowMolDesign(nn.Module):
             chain_ids=chain_ids,
             generate_mask=generate_mask,
             lengths=lengths,
+            guidance_scale=guidance_scale,
             **flow_sample_opt
         )
         
